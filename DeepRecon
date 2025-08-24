@@ -1,0 +1,62 @@
+#Deep recon probes deep
+name: Deep Recon Pipeline
+
+on:
+  push:
+    branches: [recon]
+    paths: [domains.txt]
+
+jobs:
+  deep-recon:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v3
+
+      - name: Set up Go Environment
+        uses: actions/setup-go@v4
+        with:
+          go-version: 1.21
+
+      - name: Install ProjectDiscovery + Recon Tools
+        run: |
+          go install -v github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest
+          go install -v github.com/projectdiscovery/dnsx/cmd/dnsx@latest
+          go install -v github.com/projectdiscovery/naabu/v2/cmd/naabu@latest
+          go install -v github.com/projectdiscovery/httpx/cmd/httpx@latest
+          go install -v github.com/projectdiscovery/katana/cmd/katana@latest
+          go install -v github.com/tomnomnom/waybackurls@latest
+          echo "${HOME}/go/bin" >> $GITHUB_PATH
+
+      - name: Subdomain Enumeration
+        run: |
+          subfinder -dL domains.txt -recursive -all -silent -o subdomains_raw.txt
+
+      - name: Validate Resolvable Hosts
+        run: |
+          dnsx -l subdomains_raw.txt -resp-only -silent -o subdomains_resolved.txt
+
+      - name: Active Port Scanning
+        run: |
+          naabu -list subdomains_resolved.txt -top-ports 1000 -rate 15000 -silent -o open_ports.txt
+
+      - name: Live Host Probing
+        run: |
+          httpx -l subdomains_resolved.txt -silent -status-code -title -ip -tech-detect -o live_hosts.txt
+
+      - name: Endpoint Crawling
+        run: |
+          katana -list live_hosts.txt -d 3 -silent -o katana_endpoints.txt
+          waybackurls < live_hosts.txt > wayback_endpoints.txt
+          cat katana_endpoints.txt wayback_endpoints.txt | sort -u > all_endpoints.txt
+
+      - name: Upload Recon Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: recon-data
+          path: |
+            subdomains_raw.txt
+            subdomains_resolved.txt
+            open_ports.txt
+            live_hosts.txt
+            all_endpoints.txt
