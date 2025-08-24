@@ -1,0 +1,58 @@
+name: Adaptive Vulnerability Scanning
+
+on:
+  workflow_dispatch:
+  workflow_run:
+    workflows: ["Deep Recon Pipeline"]
+    types: [completed]
+
+jobs:
+  vuln-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v3
+
+      - name: Set up Go Environment
+        uses: actions/setup-go@v4
+        with:
+          go-version: 1.21
+
+      - name: Install Nuclei + Extras
+        run: |
+          go install -v github.com/projectdiscovery/nuclei/v2/cmd/nuclei@latest
+          go install -v github.com/ffuf/ffuf@latest
+          go install -v github.com/hahwul/dalfox/v2@latest
+          echo "${HOME}/go/bin" >> $GITHUB_PATH
+
+      - name: Download Recon Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: recon-data
+
+      - name: Update Nuclei Templates
+        run: nuclei -update-templates
+
+      - name: Run Critical & High Vulnerability Scans
+        run: |
+          nuclei -l live_hosts.txt \
+            -t cves/ \
+            -t vulnerabilities/ \
+            -t misconfigurations/ \
+            -severity critical,high \
+            -stats \
+            -o nuclei_high.txt \
+            -json -o nuclei_high.json
+
+      - name: Fuzz Common Paths with ffuf
+        run: |
+          ffuf -u FUZZ -w all_endpoints.txt -recursion -rate 100 -o fuzz_results.json
+
+      - name: Upload Scanning Results
+        uses: actions/upload-artifact@v4
+        with:
+          name: vuln-results
+          path: |
+            nuclei_high.txt
+            nuclei_high.json
+            fuzz_results.json
