@@ -76,5 +76,3 @@ This framework is **for authorized security testing only**. You are responsible 
 - Shodan + Censys integration  
 - Slack/Discord alert hooks  
 - GitHub Pages dashboards  
-- Curated zero-day template packs  
-- Automated exploit generation  
