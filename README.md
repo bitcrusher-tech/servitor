@@ -1,3 +1,5 @@
+<img width="442" height="423" alt="image" src="https://github.com/user-attachments/assets/37a76b8a-4da6-4c2b-90bd-358ad6299457" />
+
 Servitor  delivers a **fully automated pentesting framework** powered by **GitHub Actions** and **ProjectDiscovery tools**. Three chained pipelines handle **recon**, **adaptive scanning**, and **reporting**, giving you continuous attack surface intelligence.
 
 
@@ -14,7 +16,7 @@ Servitor  delivers a **fully automated pentesting framework** powered by **GitHu
 |----------|---------|-------|
 | **1. Deep Recon** | Enumerates subs, resolves DNS, probes hosts, crawls endpoints | `subfinder`, `dnsx`, `naabu`, `httpx`, `katana`, `waybackurls` |
 | **2. Adaptive Vulnerability Scanning** | Targets high-priority CVEs + fuzzes endpoints dynamically | `nuclei`, `ffuf`, `dalfox` |
-| **3. Reporting & Intel Drops** | Consolidates results into Markdown + JSON reports | Built-in |
+| **3. Reporting ** | Consolidates results into Markdown + JSON reports | Built-in |
 
 ## 📂 Repository Layout
 
