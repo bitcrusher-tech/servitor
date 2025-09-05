@@ -1,5 +1,3 @@
-name: Adaptive Vulnerability Scanning
-
 on:
   workflow_dispatch:
   workflow_run:
@@ -10,13 +8,10 @@ jobs:
   vuln-scan:
     if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-latest
-
     steps:
-      - name: Checkout repo
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Set up Go
-        uses: actions/setup-go@v5
+      - uses: actions/setup-go@v5
         with:
           go-version: '1.22.x'
           cache: true
@@ -29,8 +24,8 @@ jobs:
           go install -v github.com/hahwul/dalfox/v2@latest
           echo "${HOME}/go/bin" >> "$GITHUB_PATH"
 
-      # >>> pull artifacts from the recon run that triggered us
-      - name: Download recon artifacts from triggering run
+      # When triggered by recon finishing, pull that exact run's artifact
+      - name: Download recon artifacts (from triggering recon run)
         if: ${{ github.event_name == 'workflow_run' }}
         uses: dawidd6/action-download-artifact@v6
         with:
@@ -38,59 +33,26 @@ jobs:
           run_id: ${{ github.event.workflow_run.id }}
           name: recon-data
           path: recon_artifacts
+          if_no_artifact_found: error
 
-      # also support manual runs: expect artifacts to already be present (or fail loudly)
-      - name: Use local recon artifacts (manual run)
+      # When run manually, pull the latest successful recon artifact on this branch
+      - name: Download recon artifacts (latest successful on this branch)
         if: ${{ github.event_name == 'workflow_dispatch' }}
-        run: |
-          mkdir -p recon_artifacts
-          ls -la recon_artifacts || true
+        uses: dawidd6/action-download-artifact@v6
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          workflow: Deep Recon Pipeline
+          workflow_conclusion: success
+          branch: ${{ github.ref_name }}
+          name: recon-data
+          path: recon_artifacts
+          if_no_artifact_found: error
 
       - name: Show what we got
         run: |
           echo "Artifacts directory:"
-          ls -la recon_artifacts || true
-          echo "Preview files:"
-          sed -n '1,50p' recon_artifacts/live_hosts.txt || true
-          sed -n '1,50p' recon_artifacts/all_endpoints.txt || true
-
-      - name: Update nuclei templates
-        run: nuclei -update-templates
-
-      - name: Run nuclei (critical/high)
-        run: |
-          set -x
-          nuclei -l recon_artifacts/live_hosts.txt \
-            -t cves/ -t vulnerabilities/ -t misconfigurations/ \
-            -severity critical,high \
-            -stats \
-            -o nuclei_high.txt \
-            -json -o nuclei_high.json
-
-      - name: Dalfox against discovered endpoints (light)
-        run: |
-          set -x
-          # throttle so we don't melt targets; tune as needed
-          dalfox file recon_artifacts/all_endpoints.txt \
-            --silence --mining-dict --follow-redirects \
-            --concurrency 20 --delay 0 \
-            --output dalfox_findings.txt \
-            --format json --output-file dalfox_findings.json || true
-
-      - name: Optional ffuf fuzz of endpoints (safe defaults)
-        run: |
-          set -x
-          # ffuf expects FUZZ in the URL list; we’ll just replay endpoints here for smoke testing
-          ffuf -u FUZZ -w recon_artifacts/all_endpoints.txt -rate 100 -mc all \
-               -o ffuf_results.json -of json || true
-
-      - name: Upload scan results
-        uses: actions/upload-artifact@v4
-        with:
-          name: vuln-results
-          path: |
-            nuclei_high.txt
-            nuclei_high.json
-            dalfox_findings.txt
-            dalfox_findings.json
-            ffuf_results.json
+          ls -la recon_artifacts
+          echo "--- live_hosts.txt (top 20) ---"
+          sed -n '1,20p' recon_artifacts/live_hosts.txt || true
+          echo "--- all_endpoints.txt (top 20) ---"
+          sed -n '1,20p' recon_artifacts/all_endpoints.txt || true
