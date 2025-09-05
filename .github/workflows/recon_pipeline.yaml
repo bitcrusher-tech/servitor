@@ -5,18 +5,20 @@ on:
   workflow_dispatch:
     inputs:
       target:
-        description: "Target/domain list (optional)"
+        description: "Path to domains list (one per line)"
         required: false
         default: "domains.txt"
 
 jobs:
   deep-recon:
     runs-on: ubuntu-latest
+    timeout-minutes: 60
+
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Set up Go Environment
+      - name: Set up Go
         uses: actions/setup-go@v5
         with:
           go-version: '1.22.x'
@@ -27,45 +29,88 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libpcap-dev build-essential pkg-config
 
+      - name: Show inputs + repo layout
+        run: |
+          echo "target input: ${{ github.event.inputs.target }}"
+          echo "pwd: $(pwd)"
+          ls -la
+          echo "---- domains file preview ----"
+          sed -n '1,200p' "${{ github.event.inputs.target }}" || true
+          echo "------------------------------"
+
       - name: Install ProjectDiscovery + Recon Tools
         run: |
+          set -x
           go install -v github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest
           go install -v github.com/projectdiscovery/dnsx/cmd/dnsx@latest
           go install -v github.com/projectdiscovery/naabu/v2/cmd/naabu@latest
           go install -v github.com/projectdiscovery/httpx/cmd/httpx@latest
           go install -v github.com/projectdiscovery/katana/cmd/katana@latest
           go install -v github.com/tomnomnom/waybackurls@latest
-          echo "${HOME}/go/bin" >> $GITHUB_PATH
+          echo "${HOME}/go/bin" >> "$GITHUB_PATH"
 
       - name: Subdomain Enumeration
         run: |
-          subfinder -dL ${{ github.event.inputs.target }} -recursive -all -silent -o subdomains_raw.txt
+          set -x
+          subfinder -dL "${{ github.event.inputs.target }}" -recursive -all -o subdomains_raw.txt
+          echo "raw count: $(wc -l < subdomains_raw.txt || echo 0)"
 
       - name: Validate Resolvable Hosts
         run: |
-          dnsx -l subdomains_raw.txt -resp-only -silent -o subdomains_resolved.txt
+          set -x
+          dnsx -l subdomains_raw.txt -resp-only -o subdomains_resolved.txt
+          echo "resolved count: $(wc -l < subdomains_resolved.txt || echo 0)"
+
+      - name: Build target list for active scanning (fallback if empty)
+        run: |
+          if [ -s subdomains_resolved.txt ]; then
+            cp subdomains_resolved.txt targets.txt
+            echo "Using resolved subdomains for active scan."
+          else
+            cp "${{ github.event.inputs.target }}" targets.txt
+            echo "No subdomains; falling back to original domains."
+          fi
+          # normalize: strip scheme/path if user passed URLs
+          awk '{gsub(/^https?:\/\//,""); split($0,a,"/"); print a[1]}' targets.txt | sed '/^$/d' | sort -u > targets.norm.txt
+          mv targets.norm.txt targets.txt
+          echo "targets count: $(wc -l < targets.txt)"
+          sed -n '1,50p' targets.txt
 
       - name: Active Port Scanning
         run: |
-          naabu -list subdomains_resolved.txt -top-ports 1000 -rate 15000 -silent -o open_ports.txt
+          set -x
+          naabu -list targets.txt -top-ports 1000 -rate 15000 -o open_ports.txt
+          echo "open ports lines: $(wc -l < open_ports.txt || echo 0)"
 
       - name: Live Host Probing
         run: |
-          httpx -l subdomains_resolved.txt -silent -status-code -title -ip -tech-detect -o live_hosts.txt
+          set -x
+          httpx -l targets.txt -status-code -title -ip -tech-detect -o live_hosts.txt
+          echo "live hosts lines: $(wc -l < live_hosts.txt || echo 0)"
+          sed -n '1,50p' live_hosts.txt || true
 
       - name: Endpoint Crawling
         run: |
-          katana -list live_hosts.txt -d 3 -silent -o katana_endpoints.txt
-          waybackurls < live_hosts.txt > wayback_endpoints.txt
+          set -x
+          SRC="live_hosts.txt"
+          [ -s "$SRC" ] || SRC="targets.txt"
+          katana -list "$SRC" -d 3 -o katana_endpoints.txt || true
+          waybackurls < "$SRC" > wayback_endpoints.txt || true
           cat katana_endpoints.txt wayback_endpoints.txt | sort -u > all_endpoints.txt
+          echo "endpoints: $(wc -l < all_endpoints.txt || echo 0)"
 
       - name: Upload Recon Artifacts
         uses: actions/upload-artifact@v4
         with:
           name: recon-data
+          retention-days: 7
           path: |
+            ${{ github.event.inputs.target }}
             subdomains_raw.txt
             subdomains_resolved.txt
+            targets.txt
             open_ports.txt
             live_hosts.txt
+            katana_endpoints.txt
+            wayback_endpoints.txt
             all_endpoints.txt
