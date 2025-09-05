@@ -1,4 +1,4 @@
-#Deep recon probes deep
+# Deep recon probes deep
 name: Deep Recon Pipeline
 
 on:
@@ -14,12 +14,18 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Repository
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Set up Go Environment
-        uses: actions/setup-go@v4
+        uses: actions/setup-go@v5
         with:
-          go-version: 1.21
+          go-version: '1.22.x'
+          cache: true
+
+      - name: Install OS dependencies (libpcap, gcc, pkg-config)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libpcap-dev build-essential pkg-config
 
       - name: Install ProjectDiscovery + Recon Tools
         run: |
@@ -33,7 +39,7 @@ jobs:
 
       - name: Subdomain Enumeration
         run: |
-          subfinder -dL domains.txt -recursive -all -silent -o subdomains_raw.txt
+          subfinder -dL ${{ github.event.inputs.target }} -recursive -all -silent -o subdomains_raw.txt
 
       - name: Validate Resolvable Hosts
         run: |
