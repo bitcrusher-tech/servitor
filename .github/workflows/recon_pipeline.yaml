@@ -2,9 +2,12 @@
 name: Deep Recon Pipeline
 
 on:
-  push:
-    branches: [recon]
-    paths: [domains.txt]
+  workflow_dispatch:
+    inputs:
+      target:
+        description: "Target/domain list (optional)"
+        required: false
+        default: "domains.txt"
 
 jobs:
   deep-recon:
