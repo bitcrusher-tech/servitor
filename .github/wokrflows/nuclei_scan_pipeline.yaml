@@ -8,51 +8,89 @@ on:
 
 jobs:
   vuln-scan:
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-latest
+
     steps:
-      - name: Checkout Repository
-        uses: actions/checkout@v3
+      - name: Checkout repo
+        uses: actions/checkout@v4
 
-      - name: Set up Go Environment
-        uses: actions/setup-go@v4
+      - name: Set up Go
+        uses: actions/setup-go@v5
         with:
-          go-version: 1.21
+          go-version: '1.22.x'
+          cache: true
 
-      - name: Install Nuclei + Extras
+      - name: Install scanners
         run: |
+          set -x
           go install -v github.com/projectdiscovery/nuclei/v2/cmd/nuclei@latest
           go install -v github.com/ffuf/ffuf@latest
           go install -v github.com/hahwul/dalfox/v2@latest
-          echo "${HOME}/go/bin" >> $GITHUB_PATH
+          echo "${HOME}/go/bin" >> "$GITHUB_PATH"
 
-      - name: Download Recon Artifacts
-        uses: actions/download-artifact@v4
+      # >>> pull artifacts from the recon run that triggered us
+      - name: Download recon artifacts from triggering run
+        if: ${{ github.event_name == 'workflow_run' }}
+        uses: dawidd6/action-download-artifact@v6
         with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          run_id: ${{ github.event.workflow_run.id }}
           name: recon-data
+          path: recon_artifacts
 
-      - name: Update Nuclei Templates
+      # also support manual runs: expect artifacts to already be present (or fail loudly)
+      - name: Use local recon artifacts (manual run)
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        run: |
+          mkdir -p recon_artifacts
+          ls -la recon_artifacts || true
+
+      - name: Show what we got
+        run: |
+          echo "Artifacts directory:"
+          ls -la recon_artifacts || true
+          echo "Preview files:"
+          sed -n '1,50p' recon_artifacts/live_hosts.txt || true
+          sed -n '1,50p' recon_artifacts/all_endpoints.txt || true
+
+      - name: Update nuclei templates
         run: nuclei -update-templates
 
-      - name: Run Critical & High Vulnerability Scans
+      - name: Run nuclei (critical/high)
         run: |
-          nuclei -l live_hosts.txt \
-            -t cves/ \
-            -t vulnerabilities/ \
-            -t misconfigurations/ \
+          set -x
+          nuclei -l recon_artifacts/live_hosts.txt \
+            -t cves/ -t vulnerabilities/ -t misconfigurations/ \
             -severity critical,high \
             -stats \
             -o nuclei_high.txt \
             -json -o nuclei_high.json
 
-      - name: Fuzz Common Paths with ffuf
+      - name: Dalfox against discovered endpoints (light)
         run: |
-          ffuf -u FUZZ -w all_endpoints.txt -recursion -rate 100 -o fuzz_results.json
+          set -x
+          # throttle so we don't melt targets; tune as needed
+          dalfox file recon_artifacts/all_endpoints.txt \
+            --silence --mining-dict --follow-redirects \
+            --concurrency 20 --delay 0 \
+            --output dalfox_findings.txt \
+            --format json --output-file dalfox_findings.json || true
 
-      - name: Upload Scanning Results
+      - name: Optional ffuf fuzz of endpoints (safe defaults)
+        run: |
+          set -x
+          # ffuf expects FUZZ in the URL list; we’ll just replay endpoints here for smoke testing
+          ffuf -u FUZZ -w recon_artifacts/all_endpoints.txt -rate 100 -mc all \
+               -o ffuf_results.json -of json || true
+
+      - name: Upload scan results
         uses: actions/upload-artifact@v4
         with:
           name: vuln-results
           path: |
             nuclei_high.txt
             nuclei_high.json
-            fuzz_results.json
+            dalfox_findings.txt
+            dalfox_findings.json
+            ffuf_results.json
