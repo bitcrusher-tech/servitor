@@ -16,7 +16,6 @@ on:
           - no
           - yes
 
-# Needed so this workflow can dispatch the Scan workflow when chain == 'yes'
 permissions:
   contents: read
   actions: write
@@ -45,11 +44,10 @@ jobs:
         run: |
           echo "Target file: ${{ github.event.inputs.target }}"
           echo "Chain after recon: ${{ github.event.inputs.chain || 'no' }}"
-          echo "Repository layout:"
           ls -la
           
           if [ ! -f "${{ github.event.inputs.target }}" ]; then
-            echo "ERROR: Target file not found: ${{ github.event.inputs.target }}"
+            echo "ERROR: Target file not found!"
             exit 1
           fi
           
@@ -72,26 +70,16 @@ jobs:
       - name: Subdomain Enumeration
         run: |
           set -x
-          echo "Starting subdomain enumeration..."
-          
-          # Single default tier: just run
           subfinder -dL "${{ github.event.inputs.target }}" -all -o subdomains_raw.txt -v
-          
-          # Remove duplicates and clean up
           sort -u subdomains_raw.txt > subdomains_clean.txt
           mv subdomains_clean.txt subdomains_raw.txt
-          
           echo "Raw subdomains found: $(wc -l < subdomains_raw.txt)"
 
       - name: DNS Resolution & Validation
         run: |
           set -x
-          echo "Validating DNS resolution..."
-          
-          # Resolve subdomains and get IPs/records
           dnsx -l subdomains_raw.txt -resp-only -o subdomains_resolved.txt -v
           dnsx -l subdomains_raw.txt -a -aaaa -cname -resp -o dns_records.txt -v
-          
           echo "Resolved subdomains: $(wc -l < subdomains_resolved.txt)"
 
       - name: Build Scanning Targets
@@ -99,13 +87,12 @@ jobs:
           set -x
           if [ -s subdomains_resolved.txt ]; then
             cp subdomains_resolved.txt targets.txt
-            echo "Using $(wc -l < targets.txt) resolved subdomains for scanning"
+            echo "Using $(wc -l < targets.txt) resolved subdomains"
           else
             cp "${{ github.event.inputs.target }}" targets.txt
-            echo "No subdomains resolved, using original $(wc -l < targets.txt) domains"
+            echo "No subdomains resolved, using original domains"
           fi
           
-          # Normalize targets - remove protocols and paths
           awk '{
             gsub(/^https?:\/\//,"")
             split($0,a,"/")
@@ -114,87 +101,59 @@ jobs:
           mv targets_normalized.txt targets.txt
           
           echo "Final target count: $(wc -l < targets.txt)"
-          echo "Sample targets:"
           head -10 targets.txt
 
       - name: Port Scanning
         run: |
           set -x
-          echo "Starting port scan..."
-          
-          # Single default: previously "medium"
           PORTS="-top-ports 1000"
           naabu -list targets.txt $PORTS -rate 10000 -o open_ports.txt -v
-          
           echo "Open ports found: $(wc -l < open_ports.txt)"
-          echo "Sample open ports:"
           head -20 open_ports.txt || true
 
       - name: HTTP Service Discovery
         run: |
           set -x
-          echo "Probing HTTP services..."
-          
-          # Probe both targets and open ports
           httpx -l targets.txt -status-code -title -ip -tech-detect -follow-redirects -o live_hosts_from_domains.txt -v
-          
-          # If we have open ports, probe those too
           if [ -s open_ports.txt ]; then
             httpx -l open_ports.txt -status-code -title -ip -tech-detect -follow-redirects -o live_hosts_from_ports.txt -v
             cat live_hosts_from_domains.txt live_hosts_from_ports.txt | sort -u > live_hosts.txt
           else
             mv live_hosts_from_domains.txt live_hosts.txt
           fi
-          
           echo "Live HTTP services: $(wc -l < live_hosts.txt)"
-          echo "Sample live hosts:"
           head -10 live_hosts.txt || true
 
       - name: Endpoint Discovery
         run: |
           set -x
-          echo "Crawling endpoints..."
-          
-          # Use live hosts if available, otherwise targets
           SOURCE_FILE="live_hosts.txt"
           [ -s "$SOURCE_FILE" ] || SOURCE_FILE="targets.txt"
-          
-          # Single default depth (previously "medium")
           DEPTH=2
-          
-          echo "Using source: $SOURCE_FILE ($(wc -l < $SOURCE_FILE) entries)"
-          
-          # Katana crawling
           katana -list "$SOURCE_FILE" -d $DEPTH -jc -kf all -aff -o katana_endpoints.txt -v || true
-          
-          # Wayback URLs
           cat "$SOURCE_FILE" | waybackurls > wayback_endpoints.txt || true
-          
-          # Combine and deduplicate
           cat katana_endpoints.txt wayback_endpoints.txt 2>/dev/null | sort -u > all_endpoints.txt
-          
           echo "Total endpoints discovered: $(wc -l < all_endpoints.txt)"
 
       - name: Generate Recon Summary
+        shell: bash
         run: |
-          cat > recon_summary.txt << EOF
-# Recon Summary - $(date)
-Target File: ${{ github.event.inputs.target }}
-Scope: run
-Runtime: $(date)
-
-## Statistics
-- Original domains: $(wc -l < ${{ github.event.inputs.target }})
-- Subdomains found: $(wc -l < subdomains_raw.txt || echo 0)
-- DNS resolved: $(wc -l < subdomains_resolved.txt || echo 0)
-- Final targets: $(wc -l < targets.txt || echo 0)
-- Open ports: $(wc -l < open_ports.txt || echo 0)
-- Live HTTP services: $(wc -l < live_hosts.txt || echo 0)
-- Endpoints discovered: $(wc -l < all_endpoints.txt || echo 0)
-
-Ready for vulnerability scanning phase.
-EOF
-          
+          TARGET_FILE="${{ github.event.inputs.target }}"
+          {
+            echo "# Recon Summary - $(date)"
+            echo "Target File: ${TARGET_FILE}"
+            echo "Scope: run"
+            echo "Runtime: $(date)"
+            echo
+            echo "## Statistics"
+            echo "- Original domains: $(wc -l < "${TARGET_FILE}")"
+            echo "- Subdomains found: $(wc -l < subdomains_raw.txt 2>/dev/null || echo 0)"
+            echo "- DNS resolved: $(wc -l < subdomains_resolved.txt 2>/dev/null || echo 0)"
+            echo "- Final targets: $(wc -l < targets.txt 2>/dev/null || echo 0)"
+            echo "- Open ports: $(wc -l < open_ports.txt 2>/dev/null || echo 0)"
+            echo "- Live HTTP services: $(wc -l < live_hosts.txt 2>/dev/null || echo 0)"
+            echo "- Endpoints discovered: $(wc -l < all_endpoints.txt 2>/dev/null || echo 0)"
+          } > recon_summary.txt
           echo "=== RECON SUMMARY ==="
           cat recon_summary.txt
 
@@ -217,7 +176,3 @@ EOF
           echo "Dispatching 'Vulnerability Scanning Pipeline'..."
           curl -sSL -X POST \
             -H "Accept: application/vnd.github+json" \
-            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
-            -H "X-GitHub-Api-Version: 2022-11-28" \
-            https://api.github.com/repos/${{ github.repository }}/actions/workflows/scan_pipeline.yaml/dispatches \
-            -d '{"ref":"${{ github.ref_name }}"}'
