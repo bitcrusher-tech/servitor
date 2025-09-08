@@ -1,0 +1,213 @@
+name: Vulnerability Scanning Pipeline
+
+on:
+  workflow_dispatch:
+  workflow_run:
+    workflows: ["Deep Recon Pipeline"]
+    types: [completed]
+
+jobs:
+  vuln-scan:
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22.x'
+          cache: true
+
+      - name: Install Scanning Tools
+        run: |
+          set -x
+          echo "Installing vulnerability scanners..."
+          
+          go install -v github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest
+          go install -v github.com/ffuf/ffuf@latest
+          go install -v github.com/hahwul/dalfox/v2@latest
+          go install -v github.com/projectdiscovery/httpx/cmd/httpx@latest
+          go install -v github.com/tomnomnom/gf@latest
+          go install -v github.com/lc/gau/v2/cmd/gau@latest
+          go install -v github.com/projectdiscovery/notify/cmd/notify@latest
+          echo "${HOME}/go/bin" >> "$GITHUB_PATH"
+          
+          nuclei -update-templates -silent
+
+      - name: Download recon artifacts (latest successful)
+        uses: dawidd6/action-download-artifact@v6
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          workflow: Deep Recon Pipeline
+          workflow_conclusion: success
+          branch: ${{ github.ref_name }}
+          name: recon-data
+          path: recon_artifacts
+          if_no_artifact_found: error
+
+      - name: Validate Recon Data
+        run: |
+          echo "=== RECON ARTIFACTS VALIDATION ==="
+          ls -la recon_artifacts/
+          
+          echo -e "\n=== RECON SUMMARY ==="
+          cat recon_artifacts/recon_summary.txt || echo "No recon summary found"
+          
+          echo -e "\n=== LIVE HOSTS SAMPLE ==="
+          head -10 recon_artifacts/live_hosts.txt || echo "No live hosts"
+          
+          echo -e "\n=== ENDPOINTS SAMPLE ==="
+          head -10 recon_artifacts/all_endpoints.txt || echo "No endpoints"
+          
+          echo -e "\n=== OPEN PORTS SAMPLE ==="
+          head -10 recon_artifacts/open_ports.txt || echo "No open ports"
+
+      - name: Nuclei Vulnerability Scanning
+        run: |
+          set -x
+          echo "Starting Nuclei vulnerability scans..."
+          
+          # Single default run (former "medium")
+          TEMPLATES="-t cves/ -t vulnerabilities/ -t exposures/ -t misconfiguration/"
+          RATE_LIMIT="-rl 100"
+          
+          if [ -s recon_artifacts/live_hosts.txt ]; then
+            echo "Scanning $(wc -l < recon_artifacts/live_hosts.txt) live hosts..."
+            nuclei -list recon_artifacts/live_hosts.txt $TEMPLATES $RATE_LIMIT -o nuclei_results.txt -v -json -jsonl -o nuclei_results.jsonl
+          else
+            echo "No live hosts found, scanning targets..."
+            nuclei -list recon_artifacts/targets.txt $TEMPLATES $RATE_LIMIT -o nuclei_results.txt -v -json -jsonl -o nuclei_results.jsonl
+          fi
+          
+          echo "Nuclei scan completed. Results: $(wc -l < nuclei_results.txt || echo 0)"
+
+      - name: Directory Fuzzing
+        run: |
+          set -x
+          echo "Starting directory fuzzing..."
+          
+          if [ ! -s recon_artifacts/live_hosts.txt ]; then
+            echo "No live hosts for fuzzing"
+            touch ffuf_results.txt
+            exit 0
+          fi
+          
+          wget -q https://raw.githubusercontent.com/danielmiessler/SecLists/master/Discovery/Web-Content/common.txt -O common_dirs.txt
+          
+          # Single default run (former "medium")
+          TARGET_COUNT=$(wc -l < recon_artifacts/live_hosts.txt)
+          MAX_TARGETS=20
+          THREADS=20
+          
+          head -$MAX_TARGETS recon_artifacts/live_hosts.txt > fuzz_targets.txt
+          
+          echo "Fuzzing $(wc -l < fuzz_targets.txt) targets with $THREADS threads..."
+          
+          while IFS= read -r target; do
+            clean_target=$(echo "$target" | awk '{print $1}' | sed 's/\[.*\]//')
+            echo "Fuzzing: $clean_target"
+            ffuf -u "$clean_target/FUZZ" -w common_dirs.txt -t $THREADS -s -mc 200,301,302,403 -o "ffuf_$(echo $clean_target | tr '/:' '_').json" -of json || true
+          done < fuzz_targets.txt
+          
+          find . -name "ffuf_*.json" -exec cat {} \; > ffuf_combined.json || true
+          find . -name "ffuf_*.json" -delete
+          
+          jq -r '.results[]? | "\(.status) \(.url) \(.length)"' ffuf_combined.json 2>/dev/null > ffuf_results.txt || echo "No fuzzing results" > ffuf_results.txt
+          
+          echo "Directory fuzzing completed: $(wc -l < ffuf_results.txt) results"
+
+      - name: XSS Scanning with Dalfox
+        run: |
+          set -x
+          echo "Starting XSS scanning..."
+          
+          if [ ! -s recon_artifacts/all_endpoints.txt ]; then
+            echo "No endpoints for XSS scanning"
+            touch dalfox_results.txt
+            exit 0
+          fi
+          
+          grep -E "\?.*=" recon_artifacts/all_endpoints.txt > xss_targets.txt || touch xss_targets.txt
+          
+          if [ ! -s xss_targets.txt ]; then
+            echo "No parameterized endpoints for XSS testing"
+            touch dalfox_results.txt
+            exit 0
+          fi
+          
+          # Single default run (former "medium")
+          MAX_XSS=100
+          head -$MAX_XSS xss_targets.txt > limited_xss_targets.txt
+          
+          echo "Testing $(wc -l < limited_xss_targets.txt) endpoints for XSS..."
+          dalfox file limited_xss_targets.txt -o dalfox_results.txt --delay 1000 --timeout 10 || true
+          
+          echo "XSS scanning completed: $(wc -l < dalfox_results.txt || echo 0) results"
+
+      - name: Technology Detection & Service Analysis
+        run: |
+          set -x
+          echo "Analyzing discovered technologies and services..."
+          
+          if [ -s recon_artifacts/live_services.txt ]; then
+            grep -E "\[.*\]" recon_artifacts/live_services.txt | \
+            sed 's/.*\[\(.*\)\].*/\1/' | \
+            tr ',' '\n' | \
+            sed 's/^ *//;s/ *$//' | \
+            grep -v "^$" > technologies.txt || touch technologies.txt
+            
+            cp recon_artifacts/live_services.txt service_info.txt
+          else
+            touch technologies.txt service_info.txt
+          fi
+          
+          echo "Technology analysis completed"
+
+      - name: Generate Scan Summary
+        run: |
+          cat > scan_summary.txt << EOF
+# Vulnerability Scan Summary - $(date)
+Scan Intensity: run
+Triggered by: ${{ github.event_name }}
+
+## Scan Statistics
+- Nuclei vulnerabilities: $(wc -l < nuclei_results.txt || echo 0)
+- Directory fuzzing hits: $(wc -l < ffuf_results.txt || echo 0)  
+- XSS findings: $(wc -l < dalfox_results.txt || echo 0)
+- Technologies identified: $(wc -l < technologies.txt || echo 0)
+- Services analyzed: $(wc -l < service_info.txt || echo 0)
+
+## Critical Findings
+$(head -20 nuclei_results.txt 2>/dev/null || echo "No critical findings")
+
+## High-Value Directories Found
+$(grep -E "(admin|login|config|backup|test)" ffuf_results.txt | head -10 || echo "No high-value directories")
+
+## Interesting Technologies
+$(head -10 technologies.txt 2>/dev/null || echo "No technology data")
+
+Ready for reporting phase.
+EOF
+          
+          echo "=== VULNERABILITY SCAN SUMMARY ==="
+          cat scan_summary.txt
+
+      - name: Upload Vulnerability Results
+        uses: actions/upload-artifact@v4
+        with:
+          name: vuln-scan-results
+          retention-days: 30
+          path: |
+            nuclei_results.txt
+            nuclei_results.jsonl
+            ffuf_results.txt
+            ffuf_combined.json
+            dalfox_results.txt
+            technologies.txt
+            service_info.txt
+            scan_summary.txt
+            recon_artifacts/recon_summary.txt
