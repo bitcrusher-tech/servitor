@@ -1,32 +1,206 @@
-name: Automated Reporting
+name: Automated Reporting Pipeline
 
 on:
+  workflow_dispatch:
   workflow_run:
-    workflows: ["Adaptive Vulnerability Scanning"]
+    workflows: ["Vulnerability Scanning Pipeline"]
     types: [completed]
 
 jobs:
-  report:
+  generate-report:
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+
     steps:
       - name: Checkout Repository
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
-      - name: Download Recon + Vuln Results
-        uses: actions/download-artifact@v4
-        with:
-          name: vuln-results
-
-      - name: Generate Consolidated Markdown Report
+      - name: Install Dependencies
         run: |
-          echo "# Pentest Report - $(date)" > REPORT.md
-          echo "## High Severity Vulnerabilities" >> REPORT.md
-          cat nuclei_high.txt >> REPORT.md
-          echo "## Fuzzing Insights" >> REPORT.md
-          cat fuzz_results.json >> REPORT.md
+          sudo apt-get update
+          sudo apt-get install -y jq pandoc wkhtmltopdf
 
-      - name: Upload Final Report
+      - name: Download scan results (latest successful)
+        uses: dawidd6/action-download-artifact@v6
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          workflow: Vulnerability Scanning Pipeline
+          workflow_conclusion: success
+          branch: ${{ github.ref_name }}
+          name: vuln-scan-results
+          path: scan_results
+          if_no_artifact_found: error
+
+      - name: Validate Scan Data
+        run: |
+          echo "=== SCAN RESULTS VALIDATION ==="
+          ls -la scan_results/
+          
+          echo -e "\n=== SCAN SUMMARY ==="
+          cat scan_results/scan_summary.txt || echo "No scan summary found"
+          
+          echo -e "\n=== RECON SUMMARY ==="
+          cat scan_results/recon_summary.txt || echo "No recon summary found"
+
+      - name: Parse and Prioritize Findings
+        run: |
+          echo "Analyzing and prioritizing security findings..."
+          
+          if [ -s scan_results/nuclei_results.jsonl ]; then
+            echo "Processing Nuclei findings..."
+            jq -r 'select(.info.severity == "critical" or .info.severity == "high") | "\(.info.severity | ascii_upcase) - \(.info.name) - \(.matched-at // .host)"' scan_results/nuclei_results.jsonl > critical_high_vulns.txt 2>/dev/null || touch critical_high_vulns.txt
+            jq -r 'select(.info.severity == "medium") | "\(.info.severity | ascii_upcase) - \(.info.name) - \(.matched-at // .host)"' scan_results/nuclei_results.jsonl > medium_vulns.txt 2>/dev/null || touch medium_vulns.txt
+            jq -r 'select(.info.severity == "low" or .info.severity == "info") | "\(.info.severity | ascii_upcase) - \(.info.name) - \(.matched-at // .host)"' scan_results/nuclei_results.jsonl > low_info_findings.txt 2>/dev/null || touch low_info_findings.txt
+            jq -r 'select(.info.classification.cve != null) | "CVE: \(.info.classification.cve[]) - \(.info.name) - \(.matched-at // .host)"' scan_results/nuclei_results.jsonl > cve_findings.txt 2>/dev/null || touch cve_findings.txt
+            jq -r 'select(.info.classification["owasp-top-10"] != null) | "OWASP: \(.info.classification["owasp-top-10"][]) - \(.info.name) - \(.matched-at // .host)"' scan_results/nuclei_results.jsonl > owasp_findings.txt 2>/dev/null || touch owasp_findings.txt
+          else
+            touch critical_high_vulns.txt medium_vulns.txt low_info_findings.txt cve_findings.txt owasp_findings.txt
+          fi
+          
+          if [ -s scan_results/ffuf_results.txt ]; then
+            echo "Processing directory fuzzing results..."
+            grep -iE "(admin|config|backup|test|dev|staging|api|login|upload|debug)" scan_results/ffuf_results.txt > interesting_dirs.txt || touch interesting_dirs.txt
+            grep "^200" scan_results/ffuf_results.txt > accessible_dirs.txt || touch accessible_dirs.txt
+          else
+            touch interesting_dirs.txt accessible_dirs.txt
+          fi
+          
+          if [ -s scan_results/dalfox_results.txt ]; then
+            grep -v "^$" scan_results/dalfox_results.txt > xss_findings.txt || touch xss_findings.txt
+          else
+            touch xss_findings.txt
+          fi
+          
+          cat > findings_stats.txt << EOF
+Critical/High Vulnerabilities: $(wc -l < critical_high_vulns.txt)
+Medium Severity Issues: $(wc -l < medium_vulns.txt) 
+Low/Info Findings: $(wc -l < low_info_findings.txt)
+CVE-Related Issues: $(wc -l < cve_findings.txt)
+OWASP Top 10 Issues: $(wc -l < owasp_findings.txt)
+Interesting Directories: $(wc -l < interesting_dirs.txt)
+Accessible Directories: $(wc -l < accessible_dirs.txt)
+XSS Vulnerabilities: $(wc -l < xss_findings.txt)
+EOF
+          
+          echo -e "\n=== FINDINGS STATISTICS ==="
+          cat findings_stats.txt
+
+      - name: Generate Comprehensive Markdown Report
+        run: |
+          TIMESTAMP=$(date '+%Y-%m-%d %H:%M:%S UTC')
+          
+          cat > PENTEST_REPORT.md << 'EOF'
+          # 🔒 Automated Security Assessment Report
+          
+          **Generated:** TIMESTAMP_PLACEHOLDER  
+          **Pipeline:** GitHub Actions Automated Testing  
+          **Status:** Complete ✅
+          
+          ---
+          
+          ## 🎯 Executive Summary
+          
+          This automated security assessment was conducted using a three-phase approach:
+          1. **Reconnaissance** - Asset discovery and enumeration
+          2. **Vulnerability Scanning** - Security issue identification  
+          3. **Reporting** - Prioritized findings and recommendations
+          
+          ### 📊 Key Findings Overview
+          FINDINGS_STATS_PLACEHOLDER
+          
+          ---
+          
+          ## 🚨 Critical & High Severity Vulnerabilities
+          
+          > **Priority: IMMEDIATE ACTION REQUIRED**
+          
+          These findings pose significant security risks and should be addressed immediately:
+          
+          ```
+          CRITICAL_HIGH_PLACEHOLDER
+          ```
+          
+          ---
+          
+          ## ⚠️ Medium Severity Issues
+          
+          > **Priority: Address within 30 days**
+          
+          ```
+          MEDIUM_PLACEHOLDER
+          ```
+          
+          ---
+          
+          ## 🔍 CVE-Related Vulnerabilities
+          
+          Known vulnerabilities with CVE identifiers:
+          
+          ```
+          CVE_PLACEHOLDER
+          ```
+          
+          ---
+          
+          ## 🛡️ OWASP Top 10 Findings
+          
+          Issues related to OWASP Top 10 categories:
+          
+          ```
+          OWASP_PLACEHOLDER
+          ```
+          
+          ---
+          
+          ## 📂 Directory Enumeration Results
+          
+          ### High-Value Directories Discovered
+          
+          ```
+          INTERESTING_DIRS_PLACEHOLDER
+          ```
+          
+          ### All Accessible Directories (200 OK)
+          ```
+          ACCESSIBLE_DIRS_PLACEHOLDER
+          ```
+          
+          ---
+          
+          ## 🎭 Cross-Site Scripting (XSS) Findings
+          
+          ```
+          XSS_PLACEHOLDER
+          ```
+          
+          ---
+          
+          ## 🔧 Technology Stack Analysis
+          EOF
+          
+          sed -i "s/TIMESTAMP_PLACEHOLDER/${TIMESTAMP}/" PENTEST_REPORT.md
+          sed -i "s|FINDINGS_STATS_PLACEHOLDER|$(sed -e 's/[&/]/\\&/g' findings_stats.txt)|" PENTEST_REPORT.md
+          sed -i "s|CRITICAL_HIGH_PLACEHOLDER|$(sed -e 's/[&/]/\\&/g' critical_high_vulns.txt)|" PENTEST_REPORT.md
+          sed -i "s|MEDIUM_PLACEHOLDER|$(sed -e 's/[&/]/\\&/g' medium_vulns.txt)|" PENTEST_REPORT.md
+          sed -i "s|CVE_PLACEHOLDER|$(sed -e 's/[&/]/\\&/g' cve_findings.txt)|" PENTEST_REPORT.md
+          sed -i "s|OWASP_PLACEHOLDER|$(sed -e 's/[&/]/\\&/g' owasp_findings.txt)|" PENTEST_REPORT.md
+          sed -i "s|INTERESTING_DIRS_PLACEHOLDER|$(sed -e 's/[&/]/\\&/g' interesting_dirs.txt)|" PENTEST_REPORT.md
+          sed -i "s|ACCESSIBLE_DIRS_PLACEHOLDER|$(sed -e 's/[&/]/\\&/g' accessible_dirs.txt)|" PENTEST_REPORT.md
+          sed -i "s|XSS_PLACEHOLDER|$(sed -e 's/[&/]/\\&/g' xss_findings.txt)|" PENTEST_REPORT.md
+
+      - name: Upload Report
         uses: actions/upload-artifact@v4
         with:
           name: pentest-report
-          path: REPORT.md
+          path: |
+            PENTEST_REPORT.md
+            findings_stats.txt
+            critical_high_vulns.txt
+            medium_vulns.txt
+            low_info_findings.txt
+            cve_findings.txt
+            owasp_findings.txt
+            interesting_dirs.txt
+            accessible_dirs.txt
+            xss_findings.txt
